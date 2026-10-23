@@ -185,6 +185,10 @@ var transientReasons = map[string]bool{
 	// attempt can find that it has.
 	"rcs_pending":  true,
 	"e2ee_pending": true,
+	// The Android phone's screen was locked or not on a chat: a later
+	// attempt can find it unlocked and ready.
+	"phone_locked":  true,
+	"chat_not_open": true,
 }
 
 type RefusedError struct {

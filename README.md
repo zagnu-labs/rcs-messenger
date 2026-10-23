@@ -38,7 +38,11 @@ A message is sent only when the phone's own records confirm it will be end-to-en
 
 After a send the chat is re-read as a second check. If the message went out unencrypted or as SMS anyway, it is logged at error level, recorded, and that number is never sent to again.
 
-## Pair a phone
+## Android transport (no Google web session)
+
+`RCS_TRANSPORT=android` sends by driving the Google Messages app on an Android phone over adb and reads the encrypted/plain/SMS answer off the screen before sending. Nothing expires, nothing is paired. Setup, settings, what is verified and what still needs a real RCS phone: [docs/ANDROID.md](docs/ANDROID.md). Try it without the server: `go run ./cmd/androidprobe check +15551234567`.
+
+## Pair a phone (web transport)
 
 Open http://localhost:8080/internal/rcs/pair.
 

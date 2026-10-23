@@ -16,6 +16,8 @@ import (
 	apiRCS "github.com/zagnu-labs/rcs-messenger/internal/api/rcs"
 	"github.com/zagnu-labs/rcs-messenger/internal/db"
 	"github.com/zagnu-labs/rcs-messenger/internal/logg"
+	"github.com/zagnu-labs/rcs-messenger/internal/providers/rcsandroid"
+	"github.com/zagnu-labs/rcs-messenger/internal/providers/rcsdirect"
 	"github.com/zagnu-labs/rcs-messenger/internal/providers/rcsphone"
 	"github.com/zagnu-labs/rcs-messenger/internal/rcs"
 )
@@ -31,6 +33,22 @@ type config struct {
 	WaitSeconds    int
 	MonitorSeconds int
 	Allowlist      []string
+
+	// Transport picks how messages reach the phone: "web" (Messages for web,
+	// paired once) or "android" (drive the Google Messages app over adb).
+	Transport string
+	Android   androidConfig
+}
+
+type androidConfig struct {
+	ADB          string
+	Serial       string
+	Addr         string
+	PIN          string
+	Selectors    string
+	MinGap       time.Duration
+	Jitter       time.Duration
+	SettleBudget time.Duration
 }
 
 func loadConfig() config {
@@ -43,6 +61,17 @@ func loadConfig() config {
 		WaitSeconds:    envInt("RCS_WAIT_SECONDS", 20),
 		MonitorSeconds: envInt("RCS_MONITOR_SECONDS", 60),
 		Allowlist:      envList("RCS_ALLOWLIST_PHONES"),
+		Transport:      strings.ToLower(env("RCS_TRANSPORT", "web")),
+		Android: androidConfig{
+			ADB:          env("RCS_ANDROID_ADB", "adb"),
+			Serial:       env("RCS_ANDROID_SERIAL", ""),
+			Addr:         env("RCS_ANDROID_ADDR", ""),
+			PIN:          env("RCS_ANDROID_PIN", ""),
+			Selectors:    env("RCS_ANDROID_SELECTORS", ""),
+			MinGap:       time.Duration(envInt("RCS_ANDROID_MIN_GAP_SECONDS", 45)) * time.Second,
+			Jitter:       time.Duration(envInt("RCS_ANDROID_JITTER_SECONDS", 15)) * time.Second,
+			SettleBudget: time.Duration(envInt("RCS_ANDROID_SETTLE_SECONDS", 60)) * time.Second,
+		},
 	}
 }
 
@@ -68,7 +97,9 @@ func main() {
 
 	stack := setupRCS(cfg, conn)
 	if cfg.Enabled {
-		go stack.runner.Start(ctx, nil)
+		if stack.runner != nil {
+			go stack.runner.Start(ctx, nil)
+		}
 		go rcs.NewMonitor(stack.service, nil, time.Duration(cfg.MonitorSeconds)*time.Second).Start(ctx, nil)
 	}
 
@@ -89,6 +120,15 @@ func main() {
 	}
 }
 
+// rcsSender is what both transports provide to the service.
+type rcsSender interface {
+	Enabled() bool
+	Send(ctx context.Context, to, message string, opts rcsdirect.SendOptions) (*rcsdirect.SendResult, error)
+	Check(ctx context.Context, to string) (*rcsdirect.Check, error)
+	Health(ctx context.Context) (*rcsdirect.Health, error)
+	Thread(ctx context.Context, to string, limit int) (*rcsdirect.Thread, error)
+}
+
 type rcsStack struct {
 	service *rcs.Service
 	runner  *rcsphone.Runner
@@ -96,10 +136,40 @@ type rcsStack struct {
 }
 
 func setupRCS(cfg config, conn *sql.DB) *rcsStack {
-	store := rcsphone.NewStore(conn)
-	sender := rcsphone.NewSender()
-	runner := rcsphone.NewRunner(store, sender, logg.Logger())
-	pairing := rcsphone.NewPairing(store, runner, logg.Logger())
+	var (
+		sender  rcsSender
+		runner  *rcsphone.Runner
+		pairing *rcsphone.Pairing
+	)
+	switch cfg.Transport {
+	case "android":
+		sel, err := rcsandroid.LoadSelectors(cfg.Android.Selectors)
+		if err != nil {
+			logg.Fatal().Err(err).Msg("Could not load the Android selectors")
+		}
+		a, err := rcsandroid.New(rcsandroid.Config{
+			Runner:       rcsandroid.ExecRunner{Bin: cfg.Android.ADB, Serial: cfg.Android.Serial},
+			Selectors:    sel,
+			PIN:          cfg.Android.PIN,
+			Addr:         cfg.Android.Addr,
+			MinGap:       cfg.Android.MinGap,
+			Jitter:       cfg.Android.Jitter,
+			SettleBudget: cfg.Android.SettleBudget,
+		})
+		if err != nil {
+			logg.Fatal().Err(err).Msg("Could not set up the Android sender")
+		}
+		sender = a
+		logg.Info().Msg("RCS transport: Android phone over adb (Google Messages app)")
+	case "web", "":
+		store := rcsphone.NewStore(conn)
+		web := rcsphone.NewSender()
+		runner = rcsphone.NewRunner(store, web, logg.Logger())
+		pairing = rcsphone.NewPairing(store, runner, logg.Logger())
+		sender = web
+	default:
+		logg.Fatal().Str("RCS_TRANSPORT", cfg.Transport).Msg(`RCS_TRANSPORT must be "web" or "android"`)
+	}
 
 	wait := time.Duration(cfg.WaitSeconds) * time.Second
 	if wait <= 0 {
@@ -124,13 +194,15 @@ func setupRCS(cfg config, conn *sql.DB) *rcsStack {
 	results := rcs.NewResultStore(conn)
 	svc.SetResults(results).SetBlocker(results)
 
-	runner.OnInbound(func(from, text, messageID string) {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		if _, err := svc.HandleInbound(ctx, rcs.Inbound{From: from, Text: text, MessageID: messageID}); err != nil {
-			logg.Error().Err(err).Str("from", from).Msg("RCS inbound could not be handled")
-		}
-	})
+	if runner != nil {
+		runner.OnInbound(func(from, text, messageID string) {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			if _, err := svc.HandleInbound(ctx, rcs.Inbound{From: from, Text: text, MessageID: messageID}); err != nil {
+				logg.Error().Err(err).Str("from", from).Msg("RCS inbound could not be handled")
+			}
+		})
+	}
 
 	switch {
 	case !cfg.Enabled:
@@ -152,7 +224,10 @@ func setupRouter(cfg config, stack *rcsStack) *http.Server {
 	engine := gin.New()
 	engine.Use(gin.Recovery())
 
-	e := apiRCS.NewEndpoint(stack.service).SetPairing(stack.pairing)
+	e := apiRCS.NewEndpoint(stack.service)
+	if stack.pairing != nil { // a nil *Pairing inside the interface would not read as nil
+		e.SetPairing(stack.pairing)
+	}
 	r := engine.Group("/internal/rcs")
 
 	r.GET("/health", e.Health)
@@ -175,7 +250,7 @@ func setupRouter(cfg config, stack *rcsStack) *http.Server {
 		Addr:         cfg.Addr,
 		Handler:      engine,
 		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 30 * time.Second,
+		WriteTimeout: writeTimeout(cfg),
 		IdleTimeout:  60 * time.Second,
 	}
 }
@@ -209,4 +284,14 @@ func envList(key string) []string {
 		}
 	}
 	return out
+}
+
+// writeTimeout is how long a request may take to answer. A send through the
+// phone's screen waits for a new chat to settle, for the spacing between
+// sends, and for the delivery status, so it can run for minutes.
+func writeTimeout(cfg config) time.Duration {
+	if cfg.Transport == "android" {
+		return cfg.Android.SettleBudget + cfg.Android.MinGap + cfg.Android.Jitter + 3*time.Minute
+	}
+	return 30 * time.Second
 }
